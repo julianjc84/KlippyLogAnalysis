@@ -410,11 +410,11 @@ class KlipperLogAnalyzer:
                 buffer_time=extract_float(r'buffer_time=([\d.]+)'),
                 print_stall=extract_int(r'print_stall=(\d+)'),
                 heater_bed_target=extract_float(r'heater_bed: target=([\d.]+)'),
-                heater_bed_temp=extract_float(r'heater_bed:.*temp=([\d.]+)'),
-                heater_bed_pwm=extract_float(r'heater_bed:.*pwm=([\d.]+)'),
+                heater_bed_temp=extract_float(r'heater_bed:.*?temp=([\d.]+)'),
+                heater_bed_pwm=extract_float(r'heater_bed:.*?pwm=([\d.]+)'),
                 extruder_target=extract_float(r'extruder: target=([\d.]+)'),
-                extruder_temp=extract_float(r'extruder:.*temp=([\d.]+)'),
-                extruder_pwm=extract_float(r'extruder:.*pwm=([\d.]+)'),
+                extruder_temp=extract_float(r'extruder:.*?temp=([\d.]+)'),
+                extruder_pwm=extract_float(r'extruder:.*?pwm=([\d.]+)'),
                 mcu_temp=extract_float(r'\w+_MCU: temp=([\d.]+)', None),
                 rpi_temp=extract_float(r'raspberry_pi: temp=([\d.]+)', None),
                 sysload=extract_float(r'sysload=([\d.]+)'),
@@ -442,7 +442,8 @@ class KlipperLogAnalyzer:
 
             for i, stats in enumerate(session_stats):
                 # Check if we have sd_pos (indicates printing or print file loaded)
-                if stats.sd_pos is not None and stats.sd_pos > 0:
+                # AND buffer_time > 0 (indicates actual printing, not just loaded file)
+                if stats.sd_pos is not None and stats.sd_pos > 0 and stats.buffer_time > 0:
                     # If no current print, start a new one
                     if current_print is None:
                         current_print = {
@@ -519,8 +520,16 @@ class KlipperLogAnalyzer:
                 )
                 session.print_jobs.append(print_job)
 
-        total_prints = sum(len(s.print_jobs) for s in self.sessions)
-        print(f"✅ Detected {total_prints} print job(s)")
+        all_jobs = [pj for session in self.sessions for pj in session.print_jobs]
+        MIN_SIGNIFICANT_SIZE = 100 * 1024  # 100KB
+        MIN_SIGNIFICANT_DURATION = 30  # 30 seconds
+        significant = sum(1 for pj in all_jobs if pj.max_sd_pos >= MIN_SIGNIFICANT_SIZE or pj.duration_seconds >= MIN_SIGNIFICANT_DURATION)
+        tests = len(all_jobs) - significant
+
+        if tests > 0:
+            print(f"✅ Detected {significant} print job(s) and {tests} test/calibration run(s)")
+        else:
+            print(f"✅ Detected {significant} print job(s)")
 
     def detect_retransmit_events(self):
         """Detect retransmission events by tracking bytes_retransmit changes"""
@@ -815,7 +824,7 @@ class KlipperLogAnalyzer:
             uptime_str = str(timedelta(seconds=int(session.uptime_seconds)))
             crash_marker = "💥 CRASHED" if session.crashed else "✅ Normal"
 
-            print(f"\n{self._format_session_header(session)}:")
+            print(f"\n{Colors.BOLD_CYAN}{self._format_session_header(session)}:{Colors.RESET}")
             print(f"  Lines: {session.start_line} - {session.end_line or 'EOF'}")
             print(f"  Device: {session.device or 'Unknown'}")
             print(f"  Git Version: {session.git_version or 'Unknown'}")
@@ -843,56 +852,83 @@ class KlipperLogAnalyzer:
 
             # Show print jobs for this session
             if session.print_jobs:
-                print(f"\n  📄 Print Jobs ({len(session.print_jobs)}):")
-                for j, pj in enumerate(session.print_jobs, 1):
-                    duration_str = str(timedelta(seconds=int(pj.duration_seconds)))
-                    progress = (pj.end_sd_pos / pj.max_sd_pos * 100) if pj.max_sd_pos > 0 else 0
+                # Separate significant prints from test/calibration
+                MIN_SIGNIFICANT_SIZE = 100 * 1024  # 100KB
+                MIN_SIGNIFICANT_DURATION = 30  # 30 seconds
 
-                    # Status icon
-                    status_icon = {
-                        'completed': '✅',
-                        'interrupted': '❗',
-                        'ongoing': '🔄'
-                    }.get(pj.status, '❓')
+                significant_jobs = [pj for pj in session.print_jobs
+                                   if pj.max_sd_pos >= MIN_SIGNIFICANT_SIZE or pj.duration_seconds >= MIN_SIGNIFICANT_DURATION]
+                test_jobs = [pj for pj in session.print_jobs
+                            if pj.max_sd_pos < MIN_SIGNIFICANT_SIZE and pj.duration_seconds < MIN_SIGNIFICANT_DURATION]
 
-                    # Format file size (sd_pos is in bytes)
-                    file_size_mb = pj.max_sd_pos / (1024 * 1024)
+                # Show significant prints
+                if significant_jobs:
+                    print(f"\n  📄 Print Jobs ({len(significant_jobs)}):")
+                    for j, pj in enumerate(significant_jobs, 1):
+                        duration_str = str(timedelta(seconds=int(pj.duration_seconds)))
+                        progress = (pj.end_sd_pos / pj.max_sd_pos * 100) if pj.max_sd_pos > 0 else 0
 
-                    print(f"    {j}. {status_icon} {pj.status.upper()}")
-                    print(f"       Duration: {duration_str}")
+                        # Status icon
+                        status_icon = {
+                            'completed': '✅',
+                            'interrupted': '❗',
+                            'ongoing': '🔄'
+                        }.get(pj.status, '❓')
 
-                    # For interrupted prints where file was fully read, show differently
-                    if pj.status == 'interrupted' and pj.end_sd_pos == pj.max_sd_pos:
-                        print(f"       Progress: File read: {pj.end_sd_pos:,} bytes - interrupted during execution")
-                    else:
-                        print(f"       Progress: {progress:.1f}% ({pj.end_sd_pos:,} / {pj.max_sd_pos:,} bytes)")
+                        # Format file size (sd_pos is in bytes)
+                        file_size_mb = pj.max_sd_pos / (1024 * 1024)
 
-                    print(f"       File Size: ~{file_size_mb:.2f}MB")
+                        print(f"    {j}. {status_icon} {pj.status.upper()}")
+                        print(f"       Duration: {duration_str}")
+
+                        # For interrupted prints where file was fully read, show differently
+                        if pj.status == 'interrupted' and pj.end_sd_pos == pj.max_sd_pos:
+                            print(f"       Progress: File read: {pj.end_sd_pos:,} bytes - interrupted during execution")
+                        else:
+                            print(f"       Progress: {progress:.1f}% ({pj.end_sd_pos:,} / {pj.max_sd_pos:,} bytes)")
+
+                        print(f"       File Size: ~{file_size_mb:.2f}MB")
+
+                # Show test/calibration summary if present
+                if test_jobs:
+                    print(f"\n  🔧 Test/Calibration Runs: {len(test_jobs)} (< 100KB or < 30s)")
 
         # Print jobs summary across all sessions
         all_print_jobs = [pj for session in self.sessions for pj in session.print_jobs]
         if all_print_jobs:
-            print(f"\n{'='*80}")
-            print(f"{Colors.BOLD_CYAN}📄 PRINT JOBS SUMMARY: {len(all_print_jobs)} print(s) detected{Colors.RESET}")
-            print(f"{'='*80}")
+            # Filter for significant prints only
+            MIN_SIGNIFICANT_SIZE = 100 * 1024  # 100KB
+            MIN_SIGNIFICANT_DURATION = 30  # 30 seconds
 
-            completed = sum(1 for pj in all_print_jobs if pj.status == 'completed')
-            interrupted = sum(1 for pj in all_print_jobs if pj.status == 'interrupted')
-            ongoing = sum(1 for pj in all_print_jobs if pj.status == 'ongoing')
+            significant_prints = [pj for pj in all_print_jobs
+                                 if pj.max_sd_pos >= MIN_SIGNIFICANT_SIZE or pj.duration_seconds >= MIN_SIGNIFICANT_DURATION]
+            test_prints = [pj for pj in all_print_jobs
+                          if pj.max_sd_pos < MIN_SIGNIFICANT_SIZE and pj.duration_seconds < MIN_SIGNIFICANT_DURATION]
 
-            print(f"  ✅ Completed: {completed}")
-            print(f"  ❗ Interrupted: {interrupted}")
-            if ongoing > 0:
-                print(f"  🔄 Ongoing: {ongoing}")
+            if significant_prints:
+                print(f"\n{'='*80}")
+                print(f"{Colors.BOLD_CYAN}📄 PRINT JOBS SUMMARY: {len(significant_prints)} print(s) detected{Colors.RESET}")
+                print(f"{'='*80}")
 
-            if all_print_jobs:
-                total_print_time = sum(pj.duration_seconds for pj in all_print_jobs)
-                avg_print_time = total_print_time / len(all_print_jobs)
+                completed = sum(1 for pj in significant_prints if pj.status == 'completed')
+                interrupted = sum(1 for pj in significant_prints if pj.status == 'interrupted')
+                ongoing = sum(1 for pj in significant_prints if pj.status == 'ongoing')
+
+                print(f"  ✅ Completed: {completed}")
+                print(f"  ❗ Interrupted: {interrupted}")
+                if ongoing > 0:
+                    print(f"  🔄 Ongoing: {ongoing}")
+
+                total_print_time = sum(pj.duration_seconds for pj in significant_prints)
+                avg_print_time = total_print_time / len(significant_prints)
                 total_time_str = str(timedelta(seconds=int(total_print_time)))
                 avg_time_str = str(timedelta(seconds=int(avg_print_time)))
 
                 print(f"\n  Total Print Time: {total_time_str}")
                 print(f"  Average Print Duration: {avg_time_str}")
+
+                if test_prints:
+                    print(f"\n  🔧 Test/Calibration Runs: {len(test_prints)} (not included in statistics)")
 
         # Crash summary
         crashes = [s for s in self.sessions if s.crashed]
@@ -903,7 +939,7 @@ class KlipperLogAnalyzer:
         if crashes:
             for crash in crashes:
                 uptime_str = str(timedelta(seconds=int(crash.uptime_seconds)))
-                print(f"  • Session {crash.session_number}: {crash.crash_type}")
+                print(f"  • {Colors.BOLD_CYAN}Session {crash.session_number}:{Colors.RESET} {crash.crash_type}")
                 print(f"    Uptime before crash: {uptime_str}")
 
                 # Show pre-crash stats
@@ -1095,7 +1131,7 @@ class KlipperLogAnalyzer:
                     uptime_str = str(timedelta(seconds=int(session.uptime_seconds)))
                     crash_marker = "💥 CRASHED" if session.crashed else "✅ Normal"
 
-                    print(f"\n{self._format_session_header(session)}:")
+                    print(f"\n{Colors.BOLD_CYAN}{self._format_session_header(session)}:{Colors.RESET}")
                     print(f"  Lines: {session.start_line} - {session.end_line or 'EOF'}")
                     print(f"  Device: {session.device or 'Unknown'}")
                     print(f"  Git Version: {session.git_version or 'Unknown'}")
@@ -1123,31 +1159,46 @@ class KlipperLogAnalyzer:
 
                     # Show print jobs for this session
                     if session.print_jobs:
-                        print(f"\n  📄 Print Jobs ({len(session.print_jobs)}):")
-                        for j, pj in enumerate(session.print_jobs, 1):
-                            duration_str = str(timedelta(seconds=int(pj.duration_seconds)))
-                            progress = (pj.end_sd_pos / pj.max_sd_pos * 100) if pj.max_sd_pos > 0 else 0
+                        # Separate significant prints from test/calibration
+                        MIN_SIGNIFICANT_SIZE = 100 * 1024  # 100KB
+                        MIN_SIGNIFICANT_DURATION = 30  # 30 seconds
 
-                            # Status icon
-                            status_icon = {
-                                'completed': '✅',
-                                'interrupted': '❗',
-                                'ongoing': '🔄'
-                            }.get(pj.status, '❓')
+                        significant_jobs = [pj for pj in session.print_jobs
+                                           if pj.max_sd_pos >= MIN_SIGNIFICANT_SIZE or pj.duration_seconds >= MIN_SIGNIFICANT_DURATION]
+                        test_jobs = [pj for pj in session.print_jobs
+                                    if pj.max_sd_pos < MIN_SIGNIFICANT_SIZE and pj.duration_seconds < MIN_SIGNIFICANT_DURATION]
 
-                            # Format file size (sd_pos is in bytes)
-                            file_size_mb = pj.max_sd_pos / (1024 * 1024)
+                        # Show significant prints
+                        if significant_jobs:
+                            print(f"\n  📄 Print Jobs ({len(significant_jobs)}):")
+                            for j, pj in enumerate(significant_jobs, 1):
+                                duration_str = str(timedelta(seconds=int(pj.duration_seconds)))
+                                progress = (pj.end_sd_pos / pj.max_sd_pos * 100) if pj.max_sd_pos > 0 else 0
 
-                            print(f"    {j}. {status_icon} {pj.status.upper()}")
-                            print(f"       Duration: {duration_str}")
+                                # Status icon
+                                status_icon = {
+                                    'completed': '✅',
+                                    'interrupted': '❗',
+                                    'ongoing': '🔄'
+                                }.get(pj.status, '❓')
 
-                            # For interrupted prints where file was fully read, show differently
-                            if pj.status == 'interrupted' and pj.end_sd_pos == pj.max_sd_pos:
-                                print(f"       Progress: File read: {pj.end_sd_pos:,} bytes - interrupted during execution")
-                            else:
-                                print(f"       Progress: {progress:.1f}% ({pj.end_sd_pos:,} / {pj.max_sd_pos:,} bytes)")
+                                # Format file size (sd_pos is in bytes)
+                                file_size_mb = pj.max_sd_pos / (1024 * 1024)
 
-                            print(f"       File Size: ~{file_size_mb:.2f}MB")
+                                print(f"    {j}. {status_icon} {pj.status.upper()}")
+                                print(f"       Duration: {duration_str}")
+
+                                # For interrupted prints where file was fully read, show differently
+                                if pj.status == 'interrupted' and pj.end_sd_pos == pj.max_sd_pos:
+                                    print(f"       Progress: File read: {pj.end_sd_pos:,} bytes - interrupted during execution")
+                                else:
+                                    print(f"       Progress: {progress:.1f}% ({pj.end_sd_pos:,} / {pj.max_sd_pos:,} bytes)")
+
+                                print(f"       File Size: ~{file_size_mb:.2f}MB")
+
+                        # Show test/calibration summary if present
+                        if test_jobs:
+                            print(f"\n  🔧 Test/Calibration Runs: {len(test_jobs)} (< 100KB or < 30s)")
 
             elif choice == '5':
                 self._show_communication_timeline()
@@ -1537,7 +1588,7 @@ class KlipperLogAnalyzer:
             if not session_stats:
                 continue
 
-            print(f"\n{self._format_session_header(session)}:")
+            print(f"\n{Colors.BOLD_CYAN}{self._format_session_header(session)}:{Colors.RESET}")
 
             # Get retransmit events for this session
             session_retransmits = [e for e in self.retransmit_events if e.session_number == session.session_number]
